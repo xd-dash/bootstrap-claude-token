@@ -37,7 +37,10 @@ function setInputHandler(handler) {
 
 async function publish(event) {
   await ready;
-  await publisher.publish(outputChannel, JSON.stringify(event));
+  await publisher.publish(outputChannel, JSON.stringify({
+    channel: outputChannel,
+    data: event
+  }));
 }
 
 module.exports = {
