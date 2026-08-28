@@ -1,0 +1,262 @@
+name: Token Flow Pseudo-Dispatch
+
+on:
+  push:
+    branches:
+      - automation
+    paths:
+      - ".github/requests/token-flow.env"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: token-flow-pseudo-dispatch
+  cancel-in-progress: false
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout automation request
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: dispatch
+
+      - name: Parse request
+        id: request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          request=dispatch/.github/requests/token-flow.env
+
+          read_value() {
+            sed -n "s/^$1=//p" "$request" | tail -n1
+          }
+
+          input="$(read_value input)"
+          expected="$(read_value expected)"
+          redis_port="$(read_value redis_port)"
+          input_channel="$(read_value input_channel)"
+          output_channel="$(read_value output_channel)"
+
+          [[ -n "$input" ]] || { echo "::error::input is required"; exit 1; }
+          [[ -n "$expected" ]] || { echo "::error::expected is required"; exit 1; }
+          [[ "$redis_port" =~ ^[0-9]+$ ]] || { echo "::error::redis_port must be numeric"; exit 1; }
+          [[ -n "$input_channel" ]] || { echo "::error::input_channel is required"; exit 1; }
+          [[ -n "$output_channel" ]] || { echo "::error::output_channel is required"; exit 1; }
+
+          {
+            echo "input=$input"
+            echo "expected=$expected"
+            echo "redis_port=$redis_port"
+            echo "input_channel=$input_channel"
+            echo "output_channel=$output_channel"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout application
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: app
+
+      - name: Checkout logma-serverless
+        uses: actions/checkout@v6
+        with:
+          repository: xd-dash/logma-serverless
+          ref: claude/main
+          path: logma
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.x"
+
+      - name: Install application dependencies
+        working-directory: app
+        run: npm install --ignore-scripts=false
+
+      - name: Install redis-cli
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-tools
+
+      - name: Start sus-redis
+        id: redis
+        shell: bash
+        env:
+          REDIS_PORT: ${{ steps.request.outputs.redis_port }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL             https://raw.githubusercontent.com/xd-dash/sus-redis/main/redis-server.tar.gz             -o redis-server.tar.gz
+          mkdir redis-dist
+          tar -xzf redis-server.tar.gz -C redis-dist
+
+          server="$(find redis-dist -type f -name redis-server -perm -u+x | head -n1)"
+          [[ -n "$server" ]] || {
+            echo "::error::sus-redis archive did not contain an executable redis-server"
+            exit 1
+          }
+
+          "$server"             --bind 127.0.0.1             --protected-mode no             --save ""             --appendonly no             --port "$REDIS_PORT"             > redis.log 2>&1 &
+          echo "$!" > redis.pid
+
+          for _ in {1..50}; do
+            if redis-cli -h 127.0.0.1 -p "$REDIS_PORT" PING | grep -qx PONG; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+
+          cat redis.log
+          exit 1
+
+      - name: Start Functions Framework
+        shell: bash
+        env:
+          REDIS_PORT: ${{ steps.request.outputs.redis_port }}
+          INPUT_CHANNEL: ${{ steps.request.outputs.input_channel }}
+          OUTPUT_CHANNEL: ${{ steps.request.outputs.output_channel }}
+        run: |
+          set -euo pipefail
+
+          fixture="$GITHUB_WORKSPACE/app/test/fixtures/fake-claude.js"
+          args="$(jq -cn --arg fixture "$fixture" '[$fixture]')"
+
+          (
+            cd app
+            REDIS_URL="redis://127.0.0.1:$REDIS_PORT"             CLAUDE_INPUT_CHANNEL="$INPUT_CHANNEL"             CLAUDE_OUTPUT_CHANNEL="$OUTPUT_CHANNEL"             CLAUDE_COMMAND="node"             CLAUDE_ARGS_JSON="$args"             npx functions-framework               --target=bootstrapClaudeToken               --port=8080
+          ) > function.log 2>&1 &
+          echo "$!" > function.pid
+
+          for _ in {1..100}; do
+            if curl -fsS http://127.0.0.1:8080/token/channels >/dev/null; then
+              exit 0
+            fi
+            sleep 0.1
+          done
+
+          cat function.log
+          exit 1
+
+      - name: Start Logma SSE bridge
+        shell: bash
+        env:
+          REDIS_PORT: ${{ steps.request.outputs.redis_port }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p logma/cmd/sse-test
+          cat > logma/cmd/sse-test/main.go <<'GO'
+          package main
+
+          import (
+              "log"
+              "net/http"
+
+              logmarouter "github.com/xd-dash/logma-serverless/router"
+          )
+
+          func main() {
+              log.Fatal(http.ListenAndServe(":8090", logmarouter.NewRouter()))
+          }
+          GO
+
+          (
+            cd logma
+            REDIS_URI="127.0.0.1:$REDIS_PORT"             K_SERVICE="logma-serverless"             go run ./cmd/sse-test
+          ) > logma.log 2>&1 &
+          echo "$!" > logma.pid
+
+          for _ in {1..150}; do
+            if curl -sS -o /dev/null -w '%{http_code}'               http://127.0.0.1:8090/not-a-route | grep -qE '404|405'; then
+              exit 0
+            fi
+            sleep 0.2
+          done
+
+          cat logma.log
+          exit 1
+
+      - name: Exercise Redis-driven lifecycle
+        shell: bash
+        env:
+          REDIS_PORT: ${{ steps.request.outputs.redis_port }}
+          INPUT_CHANNEL: ${{ steps.request.outputs.input_channel }}
+          OUTPUT_CHANNEL: ${{ steps.request.outputs.output_channel }}
+          INPUT: ${{ steps.request.outputs.input }}
+          EXPECTED: ${{ steps.request.outputs.expected }}
+        run: |
+          set -euo pipefail
+
+          curl -NsS             "http://127.0.0.1:8090/events?channel=$OUTPUT_CHANNEL"             > sse.log 2>&1 &
+          sse_pid=$!
+
+          for _ in {1..100}; do
+            subscribers="$(redis-cli -h 127.0.0.1 -p "$REDIS_PORT"               PUBSUB NUMSUB "$OUTPUT_CHANNEL" | tail -n1)"
+            if [[ "$subscribers" =~ ^[1-9][0-9]*$ ]]; then
+              break
+            fi
+            sleep 0.1
+          done
+
+          curl -sS -X POST http://127.0.0.1:8080/token/run > run.json &
+          run_pid=$!
+
+          for _ in {1..100}; do
+            if grep -q '"type":"started"' sse.log 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          grep -q '"type":"started"' sse.log
+
+          input_subscribers="$(redis-cli -h 127.0.0.1 -p "$REDIS_PORT"             PUBSUB NUMSUB "$INPUT_CHANNEL" | tail -n1)"
+          [[ "$input_subscribers" =~ ^[1-9][0-9]*$ ]]
+
+          redis-cli -h 127.0.0.1 -p "$REDIS_PORT"             PUBLISH "$INPUT_CHANNEL" "$INPUT" >/dev/null
+
+          wait "$run_pid"
+          jq -e '.code == 0 and .signal == null' run.json >/dev/null
+
+          for _ in {1..100}; do
+            if grep -Fq "$EXPECTED" sse.log 2>/dev/null; then
+              break
+            fi
+            sleep 0.1
+          done
+          grep -Fq "$EXPECTED" sse.log
+
+          redis-cli -h 127.0.0.1 -p "$REDIS_PORT"             PUBLISH "logma-serverless:control:shutdown:global" '{}' >/dev/null
+
+          wait "$sse_pid"
+
+      - name: Show diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          for file in redis.log function.log logma.log run.json sse.log; do
+            if [[ -f "$file" ]]; then
+              echo "===== $file ====="
+              cat "$file"
+            fi
+          done
+
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          for pidfile in function.pid logma.pid redis.pid; do
+            if [[ -f "$pidfile" ]]; then
+              kill "$(cat "$pidfile")" 2>/dev/null || true
+            fi
+          done
