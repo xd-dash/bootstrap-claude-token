@@ -1,0 +1,19 @@
+{
+  "name": "bootstrap-claude-token",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "functions-framework --target=bootstrapClaudeToken",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.231",
+    "@google-cloud/functions-framework": "5.0.5",
+    "redis": "5.8.2",
+    "simple-router-builder": "github:dash-xd/simple-router-builder#2d950a5d475c36ab8cd7d433a8be570e88c1760f"
+  }
+}
